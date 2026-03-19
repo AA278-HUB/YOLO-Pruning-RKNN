@@ -271,8 +271,18 @@ class BaseTrainer:
             example_inputs = torch.randn(1, 3, self.args.imgsz, self.args.imgsz)
             ignored_layers = []
             for m in self.model.modules():
-                if isinstance(m, (Detect, Attention, )):
+                if isinstance(m, (
+                        Detect,  # 必须忽略！检测头
+                        Attention,  # 原有注意力（如果有）
+                        DilatedReparamConv,  # ★核心：reparam 大核 + 多分支 dilation + BN 融合，强烈建议忽略
+                        LSKA,  # 注意力机制（sigmoid 加权），剪了容易崩
+                        BiFPN_SumX,  # 可学习权重 softmax 加权融合，剪通道会破坏权重逻辑
+                        C3k2_UniRepLKv5,  # 整个 C3k2_UniRepLKv5 块（包含 bottleneck）
+                        EnhancedUniRepLK_Bottleneck_v5,  # bottleneck 内部（可选，但加了更安全）
+                        C3k_UniRepLK_Enhanced_v5,  # C3k 变体（可选）
+                )):
                     ignored_layers.append(m)
+            ignored_layers.append(self.model.model[0])  # 硬编码索引
             self.pruner = tp.pruner.MagnitudePruner(
                 self.model,
                 example_inputs,
