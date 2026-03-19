@@ -2059,3 +2059,293 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+# ==================== 融合辅助函数（必须有，用于 switch_to_deploy） ====================
+def fuse_bn(conv, bn):
+    conv_bias = 0 if conv.bias is None else conv.bias
+    std = (bn.running_var + bn.eps).sqrt()
+    t = (bn.weight / std).reshape(-1, 1, 1, 1)
+    return conv.weight * t, bn.bias - bn.running_mean * bn.weight / std + conv_bias * t.squeeze()
+
+import torch.nn.functional as F
+
+
+def convert_dilated_to_nondilated(kernel, dilate_rate):
+    """
+    將空洞卷積核轉換為等效的普通卷積核 (填充零)。
+    """
+    # 修正：Depthwise 卷積的 weight 形狀是 [C, 1, K, K]
+    # 我們要確保第二維是 1，這代表它是深度可分離卷積
+    if kernel.size(1) != 1:
+        raise NotImplementedError(f"僅支持 Depthwise 卷積，當前輸入維度為 {kernel.size(1)}")
+
+    # 創建一個 1x1 的單位矩陣作為 Transpose Conv 的權重，用於插值填充零
+    # 這裡要匹配卷積核的設備和數據類型
+    identity_kernel = torch.ones((1, 1, 1, 1), device=kernel.device, dtype=kernel.dtype)
+
+    # 通過 conv_transpose2d 在卷積核元素之間插入 (dilate_rate - 1) 個零
+    dilated = F.conv_transpose2d(kernel, identity_kernel, stride=dilate_rate, groups=kernel.size(0))
+    return dilated
+
+
+def merge_dilated_into_large_kernel(large_kernel, dilated_kernel, dilated_r):
+    """
+    將擴展後的空洞卷積權重累加到主權重中。
+    """
+    large_k = large_kernel.size(2)
+
+    # 1. 轉換空洞核為等效密集核
+    equivalent_kernel = convert_dilated_to_nondilated(dilated_kernel, dilated_r)
+    equivalent_k = equivalent_kernel.size(2)
+
+    # 2. 計算需要補齊的 Padding
+    pad = (large_k - equivalent_k) // 2
+    if pad < 0:
+        # 如果空洞核擴張後比主核還大，需要對主核進行 Padding (通常不會發生，除非參數設置錯誤)
+        print(f"Warning: equivalent_k ({equivalent_k}) > large_k ({large_k})")
+        return equivalent_kernel + F.pad(large_kernel, [abs(pad)] * 4)
+
+    # 3. 將等效核對齊並相加
+    return large_kernel + F.pad(equivalent_kernel, [pad] * 4)
+
+# ==================== LSKA（纳米友好，默认 k_size=7） ====================
+class LSKA(nn.Module):
+    def __init__(self, dim, k_size=7):
+        super().__init__()
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=(1, k_size),
+                               padding=(0, k_size//2), groups=dim, bias=False)
+        self.conv2 = nn.Conv2d(dim, dim, kernel_size=(k_size, 1),
+                               padding=(k_size//2, 0), groups=dim, bias=False)
+        self.conv3 = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        u = x.clone()
+        attn = self.conv1(x)
+        attn = self.conv2(attn)
+        attn = self.conv3(attn)
+        return u * self.sigmoid(attn)
+
+# ==================== DilatedReparamConv（纳米友好，默认 k=11，可 deploy） ====================
+class DilatedReparamConv(nn.Module):
+    def __init__(self, c, k=11, deploy=False):
+        super().__init__()
+        self.deploy = deploy
+        self.c = c
+        self.k = k
+        pad = k // 2
+        self.lk_origin = nn.Conv2d(c, c, k, stride=1, padding=pad, groups=c, bias=deploy)
+
+        # --- 核心修复：先定义配置，确保任何模式下都能访问到属性 ---
+        if k == 13:
+            self.kernel_sizes = [11, 9, 7, 5, 3, 3, 3, 3, 3]
+            self.dilates      = [1,  1, 1, 1, 1, 2, 3, 4, 5]
+        elif k == 11:
+            self.kernel_sizes = [9, 7, 5, 3, 3, 3, 3]
+            self.dilates      = [1, 1, 1, 1, 2, 3, 4]
+        elif k == 9:
+            self.kernel_sizes = [7, 5, 3, 3, 3]
+            self.dilates      = [1, 1, 1, 2, 3]
+        elif k == 7:
+            self.kernel_sizes = [5, 3, 3]
+            self.dilates      = [1, 1, 2]
+        elif k == 5:
+            self.kernel_sizes = [3, 1]
+            self.dilates      = [1, 1]
+        elif k == 3:
+            self.kernel_sizes = [1]
+            self.dilates      = [1]
+        if not deploy:
+            self.origin_bn = nn.BatchNorm2d(c)
+
+            # 保持原有的 setattr 逻辑
+            for ks, r in zip(self.kernel_sizes, self.dilates):
+                pad_b = r * (ks - 1) // 2
+                setattr(self, f'dil_conv_k{ks}_{r}',
+                        nn.Conv2d(c, c, ks, 1, pad_b, dilation=r, groups=c, bias=False))
+                setattr(self, f'dil_bn_k{ks}_{r}', nn.BatchNorm2d(c))
+
+    def forward(self, x):
+        if self.deploy:
+            return self.lk_origin(x)
+
+        out = self.origin_bn(self.lk_origin(x))
+        for ks, r in zip(self.kernel_sizes, self.dilates):
+            conv = getattr(self, f'dil_conv_k{ks}_{r}')
+            bn = getattr(self, f'dil_bn_k{ks}_{r}')
+            out = out + bn(conv(x))
+        return out
+    # ==================== 融合逻辑开始 ====================
+    def _fuse_bn_tensor(self, conv, bn):
+        """ 将 Conv 和 BN 的参数融合为等效的权重和偏置 """
+        kernel = conv.weight
+        running_mean = bn.running_mean
+        running_var = bn.running_var
+        gamma = bn.weight
+        beta = bn.bias
+        eps = bn.eps
+
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+
+        # 融合后的权重: W_fused = W * (gamma / std)
+        fused_weight = kernel * t
+        # 融合后的偏置: B_fused = beta - mean * (gamma / std)
+        fused_bias = beta - running_mean * gamma / std
+        return fused_weight, fused_bias
+
+    def _dilate_tensor(self, weight, dilation):
+        """ 将带有 dilation 的卷积核膨胀为等效的密集卷积核 """
+        if dilation == 1:
+            return weight
+
+        # weight shape: [C, 1, K, K] (depthwise)
+        C, _, K, _ = weight.shape
+        new_K = (K - 1) * dilation + 1
+        # 创建一个全 0 的大核
+        dilated_weight = torch.zeros((C, 1, new_K, new_K), device=weight.device)
+        # 将原始权重填入对应的空洞位置
+        dilated_weight[:, :, ::dilation, ::dilation] = weight
+        return dilated_weight
+
+    def get_equivalent_kernel_bias(self):
+        """ 获取所有分支融合后的最终卷积核与偏置 """
+        # 1. 融合主分支
+        fused_k, fused_b = self._fuse_bn_tensor(self.lk_origin, self.origin_bn)
+
+        # 2. 遍历并融合所有空洞卷积分支
+        for ks, r in zip(self.kernel_sizes, self.dilates):
+            conv = getattr(self, f'dil_conv_k{ks}_{r}')
+            bn = getattr(self, f'dil_bn_k{ks}_{r}')
+
+            # 先融合 BN
+            k_branch, b_branch = self._fuse_bn_tensor(conv, bn)
+            # 再处理 dilation，将其膨胀成密集矩阵
+            k_branch = self._dilate_tensor(k_branch, r)
+
+            # 3. 将结果加到主分支上
+            # 需要先对齐卷积核大小 (pad 到 self.k)
+            pad_size = (self.k - k_branch.shape[2]) // 2
+            if pad_size > 0:
+                k_branch = F.pad(k_branch, [pad_size, pad_size, pad_size, pad_size])
+
+            fused_k += k_branch
+            fused_b += b_branch
+
+        return fused_k, fused_b
+
+    def switch_to_deploy(self):
+        """ 切换到推理模式：执行融合并删除多余分支 """
+        if self.deploy:
+            return
+
+        fused_k, fused_b = self.get_equivalent_kernel_bias()
+
+        # 重新初始化一个带有 bias 的卷积层
+        self.lk_origin = nn.Conv2d(self.c, self.c, self.k, stride=1,
+                                   padding=self.k // 2, groups=self.c, bias=True)
+        self.lk_origin.weight.data = fused_k
+        self.lk_origin.bias.data = fused_b
+
+        # 删除训练分支
+        for ks, r in zip(self.kernel_sizes, self.dilates):
+            self.__delattr__(f'dil_conv_k{ks}_{r}')
+            self.__delattr__(f'dil_bn_k{ks}_{r}')
+        if hasattr(self, 'origin_bn'):
+            self.__delattr__('origin_bn')
+
+        self.deploy = True
+class EnhancedUniRepLK_Bottleneck_v5(nn.Module):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=11, k_attn=7, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e*1)
+        self.cv1 = RepConv(c1, c_, k=3, s=1, g=g)          # 你原来的 RepConv
+        self.large = DilatedReparamConv(c_, k=k, deploy=False)
+        self.attn = LSKA(c_, k_size=k_attn)
+        self.ffn = nn.Sequential(
+            nn.Conv2d(c_, int(c_ * 2), 1, bias=False),
+            nn.BatchNorm2d(int(c_ * 2)),
+            nn.SiLU(),
+            nn.Conv2d(int(c_ *2), c_, 1, bias=False),
+            nn.BatchNorm2d(c_),
+        )
+        self.cv3 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+        def switch_to_deploy(self):
+            for m in self.modules():
+                if isinstance(m, RepConv) and hasattr(m, 'fuse_convs'):
+                    m.switch_to_deploy()
+
+    def forward(self, x):
+        residual = x
+        x = self.cv1(x)
+        x = self.large(x)
+        x = self.attn(x)
+        x = self.ffn(x) + x
+        x = self.cv3(x)
+        return residual + x if self.add else x
+
+# ==================== C3k v5 ====================
+class C3k_UniRepLK_Enhanced_v5(C3):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, k=11, k_attn=7, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(
+            *(EnhancedUniRepLK_Bottleneck_v5(c_, c_, shortcut, g, k=k, k_attn=k_attn, e=1.0)
+              for _ in range(n))
+        )
+
+# ==================== C3k2_UniRepLKv5（最终类） ====================
+class C3k2_UniRepLKv5(C2f):
+    def __init__(self, c1, c2, n=1, c3k=True, e=0.5, g=1, shortcut=True, k=11, k_attn=7):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k_UniRepLK_Enhanced_v5(self.c, self.c, 2, shortcut, g, k=k, k_attn=k_attn) if c3k else
+            EnhancedUniRepLK_Bottleneck_v5(self.c, self.c, shortcut, g, k=k, k_attn=k_attn)
+            for _ in range(n)
+        )
+
+    def fuse(self):
+        for m in self.modules():
+            if isinstance(m, DilatedReparamConv) and hasattr(m, 'switch_to_deploy'):
+                m.switch_to_deploy()
+class BiFPN_SumX(nn.Module):
+    def __init__(self, num_inputs, channels=512, act='swish'):
+        super(BiFPN_SumX, self).__init__()
+        # 可学习权重: [num_inputs, channels]
+        self.w = nn.Parameter(torch.ones(num_inputs, channels, dtype=torch.float32), requires_grad=True)
+        self.num_inputs = num_inputs
+        self.channels = channels
+        self.act = nn.SiLU() if act == 'swish' else nn.ReLU()
+
+    def forward(self, x):  # x: list[Tensor], 每个 shape [B, channels, H, W]（B、H、W 必须相同）
+        # per-channel softmax：在 num_inputs 维度独立 softmax
+        weight = torch.softmax(self.w, dim=0)  # [num_inputs, channels]
+
+        # 添加 batch 维度以正确广播
+        weight = weight.unsqueeze(1)  # [num_inputs, 1, channels]
+        weight = weight.unsqueeze(-1).unsqueeze(-1)  # [num_inputs, 1, channels, 1, 1]
+
+        # 堆叠输入
+        x_stack = torch.stack(x, dim=0)  # [num_inputs, B, channels, H, W]
+
+        # 加权求和
+        out = (x_stack * weight).sum(dim=0)  # [B, channels, H, W]
+
+        return self.act(out)
+class AVG(nn.Module):
+    def __init__(self, down_n=2):
+        super().__init__()
+        self.avg_pool = nn.functional.adaptive_avg_pool2d
+        self.down_n = down_n
+        # self.output_size = np.array([H, W])
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        H = int(H / self.down_n)
+        W = int(W / self.down_n)
+        output_size = np.array([H, W])
+        x = self.avg_pool(x, output_size)
+        return x
