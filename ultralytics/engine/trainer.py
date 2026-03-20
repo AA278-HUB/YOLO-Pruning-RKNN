@@ -315,7 +315,7 @@ class BaseTrainer:
             self.pruner = tp.pruner.MagnitudePruner(
                 self.model,
                 example_inputs,
-                importance = tp.importance.MagnitudeImportance(p=2),  # L2 norm pruning,
+                importance=tp.importance.MagnitudeImportance(p=2),  # L2 norm pruning,
                 iterative_steps=self.prune_iterative_steps,
                 pruning_ratio=self.prune_ratio,
                 ignored_layers=ignored_layers,
@@ -333,7 +333,6 @@ class BaseTrainer:
                 self.model.load(weights)
         else:
             self.model = self.model.to(self.device)
-
 
         self.set_model_attributes()
 
@@ -370,7 +369,21 @@ class BaseTrainer:
                     "See ultralytics.engine.trainer for customization of frozen layers."
                 )
                 v.requires_grad = True
+            # ================================================
+            # 这里加清理 non-leaf 的代码（最合适位置）
+        print("Checking and cleaning non-leaf parameters after pruning/freeze...")
+        non_leaf_count = 0
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and not param.is_leaf:
+                non_leaf_count += 1
+                print(f"  - Non-leaf param found (skipping optimize): {name}")
+                param.requires_grad = False  # 强制关闭
 
+            if non_leaf_count > 0:
+                print(f"Found {non_leaf_count} non-leaf parameters with requires_grad=True, set to False.")
+            else:
+                print("No problematic non-leaf parameters.")
+            # ================================================
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
         if self.amp and RANK in {-1, 0}:  # Single-GPU and DDP
@@ -479,7 +492,7 @@ class BaseTrainer:
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
             if self.sparse_training:
-                self.pruner.update_regularizer() # Init every epoch
+                self.pruner.update_regularizer()  # Init every epoch
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -510,7 +523,7 @@ class BaseTrainer:
                 self.scaler.scale(self.loss).backward()
 
                 if self.sparse_training:
-                    self.pruner.regularize(self.model, self.loss) # After loss.backward(), Before optimizer.step()
+                    self.pruner.regularize(self.model, self.loss)  # After loss.backward(), Before optimizer.step()
 
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
                 if ni - last_opt_step >= self.accumulate:
@@ -621,7 +634,7 @@ class BaseTrainer:
             memory = torch.cuda.memory_reserved()
             if fraction:
                 total = torch.cuda.get_device_properties(self.device).total_memory
-        return ((memory / total) if total > 0 else 0) if fraction else (memory / 2**30)
+        return ((memory / total) if total > 0 else 0) if fraction else (memory / 2 ** 30)
 
     def _clear_memory(self, threshold: float = None):
         """Clear accelerator memory by calling garbage collector and emptying cache."""
@@ -858,10 +871,10 @@ class BaseTrainer:
                 self.args = get_cfg(ckpt_args)
                 self.args.model = self.args.resume = str(last)  # reinstate model
                 for k in (
-                    "imgsz",
-                    "batch",
-                    "device",
-                    "close_mosaic",
+                        "imgsz",
+                        "batch",
+                        "device",
+                        "close_mosaic",
                 ):  # allow arg updates to reduce memory or update device on resume
                     if k in overrides:
                         setattr(self.args, k, overrides[k])
