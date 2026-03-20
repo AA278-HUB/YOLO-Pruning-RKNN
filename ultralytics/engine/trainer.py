@@ -285,19 +285,24 @@ class BaseTrainer:
             unireplk_reparam_convs = [
                 m for m in self.model.modules() if isinstance(m, DilatedReparamConv)
             ]
+
+            reparam_convs = [
+                m for m in self.model.modules() if isinstance(m, RepConv)
+            ]
             for m in unireplk_reparam_convs:
                 # switch_to_deploy is a no-op if already in deploy mode
                 m.switch_to_deploy()
-
+            for m in reparam_convs :
+                m.switch_to_deploy()
             # 2) Fuse RepConv branches (cv1 in EnhancedUniRepLK_Bottleneck_v5) so pruning can handle it.
-            for m in self.model.modules():
-                if isinstance(m, RepConv) and hasattr(m, "fuse_convs"):
-                    m.fuse_convs()
-                    # RepConv.fuse_convs sets requires_grad=False for inference; re-enable for finetune after pruning.
-                    if hasattr(m, "conv"):
-                        m.conv.requires_grad_(True)
-                        if m.conv.bias is not None:
-                            m.conv.bias.requires_grad_(True)
+            # for m in self.model.modules():
+            #     if isinstance(m, RepConv) and hasattr(m, "fuse_convs"):
+            #         m.fuse_convs()
+            #         # RepConv.fuse_convs sets requires_grad=False for inference; re-enable for finetune after pruning.
+            #         if hasattr(m, "conv"):
+            #             m.conv.requires_grad_(True)
+            #             if m.conv.bias is not None:
+            #                 m.conv.bias.requires_grad_(True)
 
             self.model.train(was_training)
 

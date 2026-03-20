@@ -2063,13 +2063,145 @@ class SAVPE(nn.Module):
 
 
 # ==================== 融合辅助函数（必须有，用于 switch_to_deploy） ====================
+
+
 def fuse_bn(conv, bn):
     conv_bias = 0 if conv.bias is None else conv.bias
     std = (bn.running_var + bn.eps).sqrt()
     t = (bn.weight / std).reshape(-1, 1, 1, 1)
     return conv.weight * t, bn.bias - bn.running_mean * bn.weight / std + conv_bias * t.squeeze()
 
-import torch.nn.functional as F
+class RepConv_Deployable(nn.Module):
+    """
+    可部署的 RepConv（RepVGG 风格），训练时多分支，推理时可切换到单一融合 Conv。
+    与 DilatedReparamConv 风格一致：有 switch_to_deploy 方法，部署后只剩 lk_origin 风格的 conv。
+    """
+    default_act = nn.SiLU()
+
+    def __init__(self, c1, c2, k=3, s=1, p=1, g=1, act=True, bn=False, deploy=False):
+        super().__init__()
+        assert k == 3 and p == 1, "RepConv_Deployable 只支持 3x3 kernel 和 p=1"
+
+        self.g = g
+        self.c1 = c1
+        self.c2 = c2
+        self.act = self.default_act if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.deploy = deploy
+
+        # 部署模式下直接创建融合 Conv
+        if deploy:
+            self.conv = nn.Conv2d(c1, c2, 3, s, padding=1, groups=g, bias=True)
+        else:
+            # 训练模式：多分支
+            self.conv3x3 = Conv(c1, c2, k=3, s=s, p=p, g=g, act=False)
+            self.conv1x1 = Conv(c1, c2, k=1, s=s, p=0, g=g, act=False)
+            self.bn_id = nn.BatchNorm2d(c1) if bn and c2 == c1 and s == 1 else None
+
+    def forward(self, x):
+        if self.deploy:
+            return self.act(self.conv(x))
+
+        # 训练模式
+        y3x3 = self.conv3x3(x)
+        y1x1 = self.conv1x1(x)
+
+        id_out = 0
+        if self.bn_id is not None:
+            id_out = self.bn_id(x)
+
+        return self.act(y3x3 + y1x1 + id_out)
+
+    def get_equivalent_kernel_bias(self):
+        """计算融合后的等效 3x3 kernel 和 bias"""
+        if self.deploy:
+            return self.conv.weight, self.conv.bias
+
+        # 融合 3x3 分支
+        k3, b3 = self._fuse_branch(self.conv3x3)
+
+        # 融合 1x1 分支（pad 到 3x3）
+        k1, b1 = self._fuse_branch(self.conv1x1)
+        k1_padded = self._pad_1x1_to_3x3(k1)
+
+        # 融合 identity BN（如果存在）
+        k_id, b_id = self._fuse_branch(self.bn_id) if self.bn_id is not None else (0, 0)
+
+        # 合并
+        fused_k = k3 + k1_padded + k_id
+        fused_b = b3 + b1 + b_id
+
+        return fused_k, fused_b
+
+    def _fuse_branch(self, branch):
+        """融合 Conv + BN 或单独 BN"""
+        if branch is None:
+            return 0, 0
+
+        if isinstance(branch, Conv):
+            conv = branch.conv
+            bn = branch.bn
+        elif isinstance(branch, nn.BatchNorm2d):
+            # identity BN
+            if not hasattr(self, 'id_tensor'):
+                input_dim = self.c1 // self.g
+                kernel_value = np.zeros((self.c1, input_dim, 3, 3), dtype=np.float32)
+                for i in range(self.c1):
+                    kernel_value[i, i % input_dim, 1, 1] = 1.0
+                self.id_tensor = torch.from_numpy(kernel_value).to(branch.weight.device, dtype=torch.float32)
+            conv = type('DummyConv', (), {'weight': self.id_tensor, 'bias': None})()
+            bn = branch
+        else:
+            return 0, 0
+
+        kernel = conv.weight
+        bias = conv.bias if conv.bias is not None else torch.zeros_like(bn.bias)
+
+        running_mean = bn.running_mean
+        running_var = bn.running_var
+        gamma = bn.weight
+        beta = bn.bias
+        eps = bn.eps
+
+        std = torch.sqrt(running_var + eps)
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+
+        fused_kernel = kernel * t
+        fused_bias = beta - running_mean * gamma / std + bias * t.squeeze()
+
+        return fused_kernel, fused_bias
+
+    @staticmethod
+    def _pad_1x1_to_3x3(k1):
+        if k1 is None or k1 == 0:
+            return 0
+        return F.pad(k1, [1, 1, 1, 1])
+
+    def switch_to_deploy(self):
+        """切换到部署模式：融合所有分支为单一 Conv，并删除多余属性"""
+        if self.deploy:
+            return
+
+        kernel, bias = self.get_equivalent_kernel_bias()
+
+        # 创建新的融合 Conv
+        self.conv = nn.Conv2d(
+            in_channels=self.c1,
+            out_channels=self.c2,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.g,
+            bias=True
+        )
+        self.conv.weight.data = kernel
+        self.conv.bias.data = bias
+
+        # 删除训练时的属性
+        for attr in ['conv3x3', 'conv1x1', 'bn_id', 'id_tensor']:
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        self.deploy = True
 
 
 def convert_dilated_to_nondilated(kernel, dilate_rate):
@@ -2261,7 +2393,7 @@ class EnhancedUniRepLK_Bottleneck_v5(nn.Module):
     def __init__(self, c1, c2, shortcut=True, g=1, k=11, k_attn=7, e=0.5):
         super().__init__()
         c_ = int(c2 * e*1)
-        self.cv1 = RepConv(c1, c_, k=3, s=1, g=g)          # 你原来的 RepConv
+        self.cv1 = RepConv_Deployable(c1, c_, k=3, s=1, g=g)          # 你原来的 RepConv
         self.large = DilatedReparamConv(c_, k=k, deploy=False)
         self.attn = LSKA(c_, k_size=k_attn)
         self.ffn = nn.Sequential(
@@ -2350,3 +2482,4 @@ class AVG(nn.Module):
         output_size = np.array([H, W])
         x = self.avg_pool(x, output_size)
         return x
+
