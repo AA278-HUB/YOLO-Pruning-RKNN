@@ -289,15 +289,15 @@ class BaseTrainer:
                 # switch_to_deploy is a no-op if already in deploy mode
                 m.switch_to_deploy()
 
-            # # 2) Fuse RepConv branches (cv1 in EnhancedUniRepLK_Bottleneck_v5) so pruning can handle it.
-            # for m in self.model.modules():
-            #     if isinstance(m, RepConv) and hasattr(m, "fuse_convs"):
-            #         m.fuse_convs()
-            #         # RepConv.fuse_convs sets requires_grad=False for inference; re-enable for finetune after pruning.
-            #         if hasattr(m, "conv"):
-            #             m.conv.requires_grad_(True)
-            #             if m.conv.bias is not None:
-            #                 m.conv.bias.requires_grad_(True)
+            # 2) Fuse RepConv branches (cv1 in EnhancedUniRepLK_Bottleneck_v5) so pruning can handle it.
+            for m in self.model.modules():
+                if isinstance(m, RepConv) and hasattr(m, "fuse_convs"):
+                    m.fuse_convs()
+                    # RepConv.fuse_convs sets requires_grad=False for inference; re-enable for finetune after pruning.
+                    if hasattr(m, "conv"):
+                        m.conv.requires_grad_(True)
+                        if m.conv.bias is not None:
+                            m.conv.bias.requires_grad_(True)
 
             self.model.train(was_training)
 
@@ -358,20 +358,6 @@ class BaseTrainer:
                             "See ultralytics.engine.trainer for customization of frozen layers."
                         )
                         v.requires_grad = True
-
-        print("Checking and cleaning non-leaf parameters after pruning/freeze...")
-        non_leaf_count = 0
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and not param.is_leaf:
-                non_leaf_count += 1
-                print(f"  - Non-leaf param found (skipping optimize): {name}")
-                param.requires_grad = False  # 强制关闭
-
-            if non_leaf_count > 0:
-                print(f"Found {non_leaf_count} non-leaf parameters with requires_grad=True, set to False.")
-            else:
-                print("No problematic non-leaf parameters.")
-            # ================================================
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
         if self.amp and RANK in {-1, 0}:  # Single-GPU and DDP
