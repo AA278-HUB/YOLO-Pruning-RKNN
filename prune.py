@@ -7,6 +7,7 @@ from ultralytics import YOLO
 # ====================== 配置路径 ======================
 yaml_path = r'ultralytics/cfg/models/11/yolo11_MAFPN_modifyX_uniRepLKv5_v2.yaml'
 data_path = r"Custom_dataset_cfg/vehicle_orientation_mini.yaml"
+data_path=r"coco8.yaml"
 model_name = r"yolo11_MAFPN_modifyX_uniRepLKv5_v2"
 
 # 加载模型（确保你的自定义模块已在 ultralytics/nn/modules/block.py 或对应文件中定义）
