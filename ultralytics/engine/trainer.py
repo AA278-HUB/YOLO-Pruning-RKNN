@@ -16,6 +16,14 @@ from copy import copy, deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from ultralytics.nn.modules import Detect, Attention
+from ultralytics.nn.modules.conv import RepConv
+from ultralytics.nn.modules.block import (
+    BiFPN_SumX,
+    C3k2_UniRepLKv5,
+    DilatedReparamConv,
+    EnhancedUniRepLK_Bottleneck_v5,
+    LSKA,
+)
 
 import numpy as np
 import torch
@@ -267,6 +275,32 @@ class BaseTrainer:
         self.run_callbacks("on_pretrain_routine_start")
         ckpt = self.setup_model()
 
+        # If pruning, fuse UniRepLK DilatedReparamConv multi-branch into a single conv first.
+        # This makes the pruning dependency graph much more stable.
+        if self.prune:
+            was_training = self.model.training
+            self.model.eval()
+            
+            # 1) Fuse DilatedReparamConv multi-dilation branches (deploy mode).
+            unireplk_reparam_convs = [
+                m for m in self.model.modules() if isinstance(m, DilatedReparamConv)
+            ]
+            for m in unireplk_reparam_convs:
+                # switch_to_deploy is a no-op if already in deploy mode
+                m.switch_to_deploy()
+
+            # 2) Fuse RepConv branches (cv1 in EnhancedUniRepLK_Bottleneck_v5) so pruning can handle it.
+            for m in self.model.modules():
+                if isinstance(m, RepConv) and hasattr(m, "fuse_convs"):
+                    m.fuse_convs()
+                    # RepConv.fuse_convs sets requires_grad=False for inference; re-enable for finetune after pruning.
+                    if hasattr(m, "conv"):
+                        m.conv.requires_grad_(True)
+                        if m.conv.bias is not None:
+                            m.conv.bias.requires_grad_(True)
+
+            self.model.train(was_training)
+
         if self.pruner is None:
             example_inputs = torch.randn(1, 3, self.args.imgsz, self.args.imgsz)
             ignored_layers = []
@@ -274,12 +308,7 @@ class BaseTrainer:
                 if isinstance(m, (
                         Detect,  # 必须忽略！检测头
                         Attention,  # 原有注意力（如果有）
-                        DilatedReparamConv,  # ★核心：reparam 大核 + 多分支 dilation + BN 融合，强烈建议忽略
-                        LSKA,  # 注意力机制（sigmoid 加权），剪了容易崩
                         BiFPN_SumX,  # 可学习权重 softmax 加权融合，剪通道会破坏权重逻辑
-                        C3k2_UniRepLKv5,  # 整个 C3k2_UniRepLKv5 块（包含 bottleneck）
-                        EnhancedUniRepLK_Bottleneck_v5,  # bottleneck 内部（可选，但加了更安全）
-                        C3k_UniRepLK_Enhanced_v5,  # C3k 变体（可选）
                 )):
                     ignored_layers.append(m)
             ignored_layers.append(self.model.model[0])  # 硬编码索引
