@@ -78,11 +78,15 @@ def prunetrain(
         )
 
 if __name__ == "__main__":
+    # Windows: needed for multiprocessing when using DataLoader workers.
+    from torch.multiprocessing import freeze_support
+    freeze_support()
+
     # ====================== 推荐运行：Normal Pruning（针对 RTX 4060 Ti） ======================
     prunetrain(
         quick_pruning=False,  # False = 先训 → 剪枝 → 再训（精度最佳）
-        train_epochs=50,  # 剪枝前训练轮数（可调 5-15，根据数据集大小）
-        prune_epochs=150,  # 剪枝后微调轮数（建议 15+，恢复精度关键）
+        train_epochs=3,  # 剪枝前训练轮数（测试先跑通）
+        prune_epochs=2,  # 剪枝后微调轮数（测试先跑通）
         imgsz=640,
         batch=16,  # 自动 batch（最安全，适配 4060 Ti 8GB/16GB）
         # batch=8,                    # 如果自动失败，手动设 6-8（8GB 卡）或 12-16（16GB 卡）
