@@ -77,40 +77,40 @@ def prunetrain(
             **common_args
         )
 
+if __name__ == "__main__":
+    # ====================== 推荐运行：Normal Pruning（针对 RTX 4060 Ti） ======================
+    prunetrain(
+        quick_pruning=False,  # False = 先训 → 剪枝 → 再训（精度最佳）
+        train_epochs=50,  # 剪枝前训练轮数（可调 5-15，根据数据集大小）
+        prune_epochs=150,  # 剪枝后微调轮数（建议 15+，恢复精度关键）
+        imgsz=640,
+        batch=16,  # 自动 batch（最安全，适配 4060 Ti 8GB/16GB）
+        # batch=8,                    # 如果自动失败，手动设 6-8（8GB 卡）或 12-16（16GB 卡）
+        device=[0],
+        name=model_name + '_prune40_iter2',  # 保存目录区分
+        prune_ratio=0.40,  # 40% 起步（你的 UniRepLK 大核敏感，先别 50%）
+        prune_iterative_steps=2,  # 分 2 次剪（更稳，精度掉得少）
+        sparse_training=True,  # 开启 BN 稀疏正则化（强烈推荐！）
+        workers=8,  # 数据加载线程
+        patience=50  # 早停
+    )
 
-# ====================== 推荐运行：Normal Pruning（针对 RTX 4060 Ti） ======================
-prunetrain(
-    quick_pruning=False,  # False = 先训 → 剪枝 → 再训（精度最佳）
-    train_epochs=100,  # 剪枝前训练轮数（可调 5-15，根据数据集大小）
-    prune_epochs=100,  # 剪枝后微调轮数（建议 15+，恢复精度关键）
-    imgsz=640,
-    batch=16,  # 自动 batch（最安全，适配 4060 Ti 8GB/16GB）
-    # batch=8,                    # 如果自动失败，手动设 6-8（8GB 卡）或 12-16（16GB 卡）
-    device=[0],
-    name=model_name + '_prune40_iter2',  # 保存目录区分
-    prune_ratio=0.40,  # 40% 起步（你的 UniRepLK 大核敏感，先别 50%）
-    prune_iterative_steps=2,  # 分 2 次剪（更稳，精度掉得少）
-    sparse_training=True,  # 开启 BN 稀疏正则化（强烈推荐！）
-    workers=8,  # 数据加载线程
-    patience=50  # 早停
-)
+    # ====================== 备选：Quick Pruning（快速测试用，注释掉） ======================
+    # prunetrain(
+    #     quick_pruning=True,
+    #     train_epochs=15,              # 直接剪 + 训
+    #     imgsz=640,
+    #     batch=-1,
+    #     device=[0],
+    #     name=model_name + '_quick_prune40',
+    #     prune_ratio=0.40,
+    #     prune_iterative_steps=2,
+    #     sparse_training=True,
+    #     workers=8,
+    #     patience=50
+    # )
 
-# ====================== 备选：Quick Pruning（快速测试用，注释掉） ======================
-# prunetrain(
-#     quick_pruning=True,
-#     train_epochs=15,              # 直接剪 + 训
-#     imgsz=640,
-#     batch=-1,
-#     device=[0],
-#     name=model_name + '_quick_prune40',
-#     prune_ratio=0.40,
-#     prune_iterative_steps=2,
-#     sparse_training=True,
-#     workers=8,
-#     patience=50
-# )
-
-print("剪枝训练启动完成！")
-print("监控显存：运行时开终端输入 'watch -n 0.5 nvidia-smi'")
-print("剪枝后模型保存在 runs/train/.../weights/best.pt")
-print("如 OOM，尝试 batch=6 或 prune_ratio=0.3")
+    print("剪枝训练启动完成！")
+    print("监控显存：运行时开终端输入 'watch -n 0.5 nvidia-smi'")
+    print("剪枝后模型保存在 runs/train/.../weights/best.pt")
+    print("如 OOM，尝试 batch=6 或 prune_ratio=0.3")
